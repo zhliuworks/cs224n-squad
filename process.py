@@ -1,7 +1,10 @@
+import os
 import numpy as np
 from collections import defaultdict, OrderedDict
 from tqdm import trange
 from multiprocessing import Pool, cpu_count
+
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
 
 class SquadPreprocess:
@@ -128,6 +131,54 @@ class SquadPreprocess:
         # Since one example might give us several features if it has a long context, we need a map from a feature to
         # its corresponding example. This key gives us just that.
         sample_mapping = tokenized_examples.pop('overflow_to_sample_mapping')
+
+        # Let's label those examples!
+        tokenized_examples['start_positions'] = []
+        tokenized_examples['end_positions'] = []
+
+        for i, offsets in enumerate(tokenized_examples['offset_mapping']):
+            # We will label impossible answers with the index of the CLS token.
+            input_ids = tokenized_examples['input_ids'][i]
+            cls_index = input_ids.index(self.tokenizer.cls_token_id)
+
+            # Grab the sequence corresponding to that example (to know what is the context and what is the question).
+            sequence_ids = tokenized_examples.sequence_ids(i)
+
+            # One example can give several spans, this is the index of the example containing this span of text.
+            sample_index = sample_mapping[i]
+            answers = examples['answers'][sample_index]
+            # If no answers are given, set the cls_index as answer.
+            if len(answers['answer_start']) == 0:
+                tokenized_examples['start_positions'].append(cls_index)
+                tokenized_examples['end_positions'].append(cls_index)
+            else:
+                # Start/end character index of the answer in the text.
+                start_char = answers['answer_start'][0]
+                end_char = start_char + len(answers['text'][0])
+
+                # Start token index of the current span in the text.
+                token_start_index = 0
+                while sequence_ids[token_start_index] != (1 if self.pad_on_right else 0):
+                    token_start_index += 1
+
+                # End token index of the current span in the text.
+                token_end_index = len(input_ids) - 1
+                while sequence_ids[token_end_index] != (1 if self.pad_on_right else 0):
+                    token_end_index -= 1
+
+                # Detect if the answer is out of the span (in which case this feature is labeled with the CLS index).
+                if not (offsets[token_start_index][0] <= start_char and offsets[token_end_index][1] >= end_char):
+                    tokenized_examples['start_positions'].append(cls_index)
+                    tokenized_examples['end_positions'].append(cls_index)
+                else:
+                    # Otherwise move the token_start_index and token_end_index to the two ends of the answer.
+                    # Note: we could go after the last offset if the answer is the last word (edge case).
+                    while token_start_index < len(offsets) and offsets[token_start_index][0] <= start_char:
+                        token_start_index += 1
+                    tokenized_examples['start_positions'].append(token_start_index - 1)
+                    while offsets[token_end_index][1] >= end_char:
+                        token_end_index -= 1
+                    tokenized_examples['end_positions'].append(token_end_index + 1)
 
         # We keep the example_id that gave us this feature and we will store the offset mappings.
         tokenized_examples['example_id'] = []
@@ -289,7 +340,7 @@ def test_process_test_set(datasets, preprocessor):
     dev_dataset, offset_mappings, example_ids = preprocessor.process_dataset(datasets['dev'], is_train=False)
     dev_dataloader = DataLoader(dev_dataset, batch_size=16, shuffle=False, num_workers=8, collate_fn=default_data_collator)
     batch = next(iter(dev_dataloader))
-    print(batch.keys()) # dict_keys(['input_ids', 'token_type_ids', 'attention_mask'])
+    print(batch.keys()) # dict_keys(['input_ids', 'token_type_ids', 'attention_mask', 'start_positions', 'end_positions'])
     return batch, datasets['dev'][:16], dev_dataset[:16], offset_mappings[:16], example_ids[:16]
 
 def test_postprocess_predictions(batch, tokenizer, raw_dataset, pro_dataset, offset_mappings, example_ids):
