@@ -8,7 +8,7 @@ TODO: update the requirements.txt via `pipreqs .`
 ```shell
 pip install -r requirements.txt
 ```
-2. Download and transform CS224n-specific SQuAD2.0 (see [data/README.md]())
+2. Download and transform CS224n-specific SQuAD2.0 (see [data/README.md](https://github.com/zhliuworks/cs224n-squad/tree/master/data))
 
 ## Train
 ...
