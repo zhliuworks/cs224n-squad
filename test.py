@@ -1,4 +1,3 @@
-import argparse
 import os
 import json
 import torch
@@ -9,27 +8,15 @@ from datasets import load_dataset
 import evaluate
 from tqdm import tqdm
 
+from arg import get_test_args
 from process import SquadPreprocess, SquadPostprocess
 import util
 
 
-def get_test_args():
-    parser = argparse.ArgumentParser('Test a trained model on SQuAD 2.0')
-    add = parser.add_argument
-    add('--ckpt_path', type=str, required=True)
-    add('--pred_path', type=str, default=None, help='load predictions to just compute the metrics')
-    add('--split', type=str, default='dev', choices=['train', 'dev', 'test'])
-    add('--gpu_ids', type=str, default='0', help='cuda visible devices')
-    add('--batch_size', type=int, default=32, help='batch size per GPU for data loading')
-    add('--num_workers', type=int, default=32, help='#processes for data loading')
-    add('--batch_size_postpro', type=int, default=1024, help='batch size for parallel post-processing')
-    args = parser.parse_args()
-    return args
-
-
 def test(args):
+    # setup
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_ids
-    name = args.ckpt_path.replace('/', '-')
+    name = args.pretrain_model.replace('/', '-')
     save_dir = util.get_save_dir('save', name, training=False)
     log = util.get_logger(save_dir, name)
     device, gpu_ids = util.get_available_devices()
@@ -44,20 +31,23 @@ def test(args):
     if args.pred_path is None:
         # pre-process the dataset
         log.info('Pre-processing dataset')
-        tokenizer = AutoTokenizer.from_pretrained(args.ckpt_path)
+        tokenizer = AutoTokenizer.from_pretrained(args.pretrain_model)
         preprocessor = SquadPreprocess(tokenizer)
         pro_dataset, offset_mappings, example_ids = preprocessor.process_dataset(raw_dataset[args.split], is_train=False)
         dataloader = DataLoader(
             pro_dataset,
             batch_size=args.batch_size,
             shuffle=False,
-            num_workers=32,
+            num_workers=args.num_workers,
             collate_fn=default_data_collator
         )
 
         # get model
-        log.info(f'Loading model from {args.ckpt_path}')
-        model = AutoModelForQuestionAnswering.from_pretrained(args.ckpt_path)
+        log.info(f'Loading model from {args.pretrain_model}')
+        model = AutoModelForQuestionAnswering.from_pretrained(args.pretrain_model)
+        if args.trained_weight_path is not None:
+            log.info(f'Loading trained weights from {args.trained_weight_path}')
+            model.load_state_dict(torch.load(args.trained_weight_path))
         model = nn.DataParallel(model, gpu_ids)
         model = model.to(device)
         model.eval()
@@ -108,5 +98,4 @@ def test(args):
 
 
 if __name__ == '__main__':
-    args = get_test_args()
-    test(args)
+    test(get_test_args())

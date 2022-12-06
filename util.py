@@ -1,7 +1,11 @@
 import os
 import tqdm
 import logging
+import random
+import numpy as np
 import torch
+import shutil
+import queue
 
 
 def get_save_dir(base_dir, name, training, id_max=100):
@@ -99,3 +103,147 @@ def get_available_devices():
         device = torch.device('cpu')
 
     return device, gpu_ids
+
+
+def set_random_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+class EMA:
+    """Exponential moving average of model parameters.
+    Args:
+        model (torch.nn.Module): Model with parameters whose EMA will be kept.
+        decay (float): Decay rate for exponential moving average.
+    """
+    def __init__(self, model, decay):
+        self.decay = decay
+        self.shadow = {}
+        self.original = {}
+
+        # Register model parameters
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+
+    def __call__(self, model, num_updates):
+        decay = min(self.decay, (1.0 + num_updates) / (10.0 + num_updates))
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                assert name in self.shadow
+                new_average = \
+                    (1.0 - decay) * param.data + decay * self.shadow[name]
+                self.shadow[name] = new_average.clone()
+
+    def assign(self, model):
+        """Assign exponential moving average of parameter values to the
+        respective parameters.
+        Args:
+            model (torch.nn.Module): Model to assign parameter values.
+        """
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                assert name in self.shadow
+                self.original[name] = param.data.clone()
+                param.data = self.shadow[name]
+
+    def resume(self, model):
+        """Restore original parameters to a model. That is, put back
+        the values that were in each parameter at the last call to `assign`.
+        Args:
+            model (torch.nn.Module): Model to assign parameter values.
+        """
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                assert name in self.shadow
+                param.data = self.original[name]
+
+
+class CheckpointSaver:
+    """Class to save and load model checkpoints.
+    Save the best checkpoints as measured by a metric value passed into the
+    `save` method. Overwrite checkpoints with better checkpoints once
+    `max_checkpoints` have been saved.
+    Args:
+        save_dir (str): Directory to save checkpoints.
+        max_checkpoints (int): Maximum number of checkpoints to keep before
+            overwriting old ones.
+        metric_name (str): Name of metric used to determine best model.
+        maximize_metric (bool): If true, best checkpoint is that which maximizes
+            the metric value passed in via `save`. Otherwise, best checkpoint
+            minimizes the metric.
+        log (logging.Logger): Optional logger for printing information.
+    """
+    def __init__(self, save_dir, max_checkpoints, metric_name,
+                 maximize_metric=False, log=None):
+        super(CheckpointSaver, self).__init__()
+
+        self.save_dir = save_dir
+        self.max_checkpoints = max_checkpoints
+        self.metric_name = metric_name
+        self.maximize_metric = maximize_metric
+        self.best_val = None
+        self.ckpt_paths = queue.PriorityQueue()
+        self.log = log
+        self._print(f"Saver will {'max' if maximize_metric else 'min'}imize {metric_name}...")
+
+    def is_best(self, metric_val):
+        """Check whether `metric_val` is the best seen so far.
+        Args:
+            metric_val (float): Metric value to compare to prior checkpoints.
+        """
+        if metric_val is None:
+            # No metric reported
+            return False
+
+        if self.best_val is None:
+            # No checkpoint saved yet
+            return True
+
+        return ((self.maximize_metric and self.best_val < metric_val)
+                or (not self.maximize_metric and self.best_val > metric_val))
+
+    def _print(self, message):
+        """Print a message if logging is enabled."""
+        if self.log is not None:
+            self.log.info(message)
+
+    def save(self, step, model, metric_val, device):
+        """Save model parameters to disk.
+        Args:
+            step (int): Total number of examples seen during training so far.
+            model (torch.nn.DataParallel): Model to save.
+            metric_val (float): Determines whether checkpoint is best so far.
+            device (torch.device): Device where model resides.
+        """
+        checkpoint_path = os.path.join(self.save_dir, f'step_{step}.pth')
+        torch.save(model.cpu().state_dict(), checkpoint_path)
+        model.to(device)
+        self._print(f'Saved checkpoint: {checkpoint_path}')
+
+        if self.is_best(metric_val):
+            # Save the best model
+            self.best_val = metric_val
+            best_path = os.path.join(self.save_dir, 'best.pth')
+            shutil.copy(checkpoint_path, best_path)
+            self._print(f'New best checkpoint at step {step}...')
+
+        # Add checkpoint path to priority queue (lowest priority removed first)
+        if self.maximize_metric:
+            priority_order = metric_val
+        else:
+            priority_order = -metric_val
+
+        self.ckpt_paths.put((priority_order, checkpoint_path))
+
+        # Remove a checkpoint if more than max_checkpoints have been saved
+        if self.ckpt_paths.qsize() > self.max_checkpoints:
+            _, worst_ckpt = self.ckpt_paths.get()
+            try:
+                os.remove(worst_ckpt)
+                self._print(f'Removed checkpoint: {worst_ckpt}')
+            except OSError:
+                # Avoid crashing if checkpoint has been removed or protected
+                pass
