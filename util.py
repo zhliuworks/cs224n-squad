@@ -219,7 +219,7 @@ class CheckpointSaver:
             device (torch.device): Device where model resides.
         """
         checkpoint_path = os.path.join(self.save_dir, f'step_{step}.pth')
-        torch.save(model.cpu().state_dict(), checkpoint_path)
+        torch.save(model.module.cpu().state_dict(), checkpoint_path)
         model.to(device)
         self._print(f'Saved checkpoint: {checkpoint_path}')
 
